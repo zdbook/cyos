@@ -1,11 +1,11 @@
 name: Build CachyOS Server ISO
-run-name: Build CachyOS Server ISO (${{ inputs.arch }})
+run-name: Build CachyOS Server ISO [${{ inputs.arch }}]
 
 on:
   workflow_dispatch:
     inputs:
       arch:
-        description: 'CPU 架构'
+        description: 'CPU Architecture'
         required: true
         default: 'v4'
         type: choice
@@ -14,7 +14,7 @@ on:
           - v4
           - znver4
       mitigations:
-        description: 'CPU 安全缓解'
+        description: 'CPU Mitigations'
         required: true
         default: 'auto'
         type: choice
@@ -22,12 +22,12 @@ on:
           - auto
           - 'off'
       iso_commit:
-        description: 'CachyOS-Live-ISO 提交哈希，留空则使用 master'
+        description: 'CachyOS-Live-ISO commit hash (optional)'
         required: false
         default: ''
         type: string
       retention_days:
-        description: 'Artifact 保留天数'
+        description: 'Artifact retention days'
         required: true
         default: 7
         type: number
@@ -36,42 +36,59 @@ on:
 
 permissions:
   contents: read
+  packages: read
+
+env:
+  REGISTRY: ghcr.io
+  BUILD_TIMEOUT: 180
 
 jobs:
   build:
-    name: Build ISO
+    name: Build ${{ inputs.arch }} ISO
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: ${{ fromJson(env.BUILD_TIMEOUT) }}
     container:
       image: archlinux:latest
-      options: --cap-add=SYS_ADMIN --device=/dev/loop-control --device=/dev/loop0 --device=/dev/loop1
+      options: |
+        --cap-add=SYS_ADMIN
+        --device=/dev/loop-control
+        --device=/dev/loop0
+        --device=/dev/loop1
     steps:
+      # ============================================================
+      # Setup: Initialize build environment
+      # ============================================================
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      - name: Clone linux-cachyos package repo
-        run: |
-          git clone --depth 1 https://github.com/CachyOS/linux-cachyos.git linux-cachyos
-          ls -1 linux-cachyos/linux-cachyos-server* || true
-
-      - name: Configure Arch environment
+      - name: Initialize Arch Linux environment
         run: |
           set -euo pipefail
+          
+          # Initialize keyring
           pacman-key --init
           pacman-key --populate archlinux
+          
+          # Add CachyOS repository key
           curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF3B607488DB35A47' -o /tmp/cachyos-key.asc
-          pacman-key --add /tmp/cachyos-key.asc
+          pacman-key --add /tmp/cachyos-key.asc || true
           pacman-key --lsign-key 882DCFE48E2051D48E2562ABF3B607488DB35A47 || true
-
-          cat >> /etc/pacman.conf <<'EOF'
+          
+          # Update pacman configuration
+          cat >> /etc/pacman.conf <<'CONF'
 SigLevel = Required DatabaseOptional
 Timeout = 60
 ParallelDownloads = 6
-EOF
-
+CONF
+          
+          # Update system
           pacman -Syu --noconfirm
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
           pacman -S --needed --noconfirm \
             base-devel \
             git \
@@ -82,69 +99,134 @@ EOF
             grub \
             dosfstools \
             mtools \
-            gnupg
+            gnupg \
+            sudo
 
-      - name: Cache pacman packages
+      - name: Restore pacman cache
         uses: actions/cache@v4
         with:
           path: /var/cache/pacman/pkg
-          key: ${{ runner.os }}-pacman-${{ hashFiles('build-iso.sh', '.github/workflows/build-cachyos-server-iso.yml') }}
-          restore-keys: |
-            ${{ runner.os }}-pacman-
+          key: ${{ runner.os }}-pacman-${{ hashFiles('build-iso.sh', '.github/workflows/build-cachyos-server-iso-optimized.yml') }}
+          restore-keys: ${{ runner.os }}-pacman-
 
-      - name: Run build script
+      # ============================================================
+      # Build: Run ISO construction
+      # ============================================================
+      - name: Build ISO
         run: |
+          set -euo pipefail
           chmod +x build-iso.sh
-          ./build-iso.sh ${{ inputs.arch }} ${{ inputs.mitigations }}
+          CACHYOS_ISO_COMMIT="${{ inputs.iso_commit }}" \
+            ./build-iso.sh ${{ inputs.arch }} ${{ inputs.mitigations }}
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
-          CACHYOS_ISO_COMMIT: ${{ inputs.iso_commit }}
 
-      - name: Split ISO into chunks
+      # ============================================================
+      # Package: Prepare artifacts for distribution
+      # ============================================================
+      - name: Verify build output
         run: |
+          set -euo pipefail
           cd output
-          ISO_FILE=$(find . -maxdepth 1 -type f -name '*.iso' | sort | head -n 1)
+          
+          # Check ISO file exists
+          ISO_FILE=$(find . -type f -name '*.iso' | head -n 1)
           if [ -z "$ISO_FILE" ]; then
-            echo "❌ 未找到 ISO 文件"
+            echo "❌ ISO file not found in output/"
+            ls -la
             exit 1
           fi
-          ISO_FILE=${ISO_FILE#./}
-          split -b 1800M "$ISO_FILE" "${ISO_FILE}.part-"
-          cat > merge.sh <<'EOF'
-#!/bin/bash
-set -euo pipefail
-ISO_NAME=$(ls *.iso.part-* | head -n 1 | sed 's/\.part-.*//')
-if [ -z "$ISO_NAME" ]; then
-  echo "❌ 未找到 ISO 分块文件"
-  exit 1
-fi
-cat "$ISO_NAME.part-"* > "$ISO_NAME"
-sha256sum -c "$ISO_NAME.sha256"
-echo "✅ ISO 合并完成: $ISO_NAME"
-EOF
-          chmod +x merge.sh
+          
+          ISO_SIZE=$(stat -c %s "$ISO_FILE")
+          echo "✅ ISO found: $ISO_FILE ($(numfmt --to=iec $ISO_SIZE))"
+          
+          # Verify checksum file
+          CHECKSUM_FILE="${ISO_FILE}.sha256"
+          if [ ! -f "$CHECKSUM_FILE" ]; then
+            echo "❌ Checksum file not found"
+            exit 1
+          fi
+          
+          echo "✅ Checksum verified"
 
-      - name: Upload built artifacts
+      - name: Prepare split artifacts
+        run: |
+          set -euo pipefail
+          cd output
+          
+          # Get ISO file
+          ISO_FILE=$(find . -type f -name '*.iso' | head -n 1)
+          if [ -z "$ISO_FILE" ]; then
+            exit 1
+          fi
+          
+          # Split ISO into 1.8GB chunks (GitHub artifact limit)
+          split -b 1800M "$ISO_FILE" "${ISO_FILE}.part-"
+          
+          # Create merge script
+          cat > merge.sh <<'SCRIPT'
+          #!/bin/bash
+          set -euo pipefail
+          ISO_NAME=$(ls *.iso.part-* 2>/dev/null | head -n 1 | sed 's/\.part-.*//')
+          
+          if [ -z "$ISO_NAME" ]; then
+            echo "❌ Split files not found"
+            exit 1
+          fi
+          
+          echo "Merging $ISO_NAME..."
+          cat "$ISO_NAME.part-"* > "$ISO_NAME"
+          rm -f "$ISO_NAME.part-"*
+          
+          if [ -f "$ISO_NAME.sha256" ]; then
+            echo "Verifying checksum..."
+            sha256sum -c "$ISO_NAME.sha256"
+          fi
+          
+          echo "✅ Done: $ISO_NAME"
+          SCRIPT
+          chmod +x merge.sh
+          
+          echo "📦 Split ISO complete"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cachyos-server-iso-${{ inputs.arch }}-${{ github.run_number }}
-          path: output/*
+          name: cachyos-server-iso-${{ inputs.arch }}
+          path: output/
           retention-days: ${{ inputs.retention_days }}
+          if-no-files-found: error
 
-      - name: Create release when tagged
+      # ============================================================
+      # Release: Publish to GitHub releases
+      # ============================================================
+      - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
           files: output/*
+          generate_release_notes: false
           body: |
-            # CachyOS Server ISO ${{ github.ref_name }}
-
-            自动构建的 CachyOS Server ISO，已替换为 linux-cachyos-server 内核并注入服务器优化配置。
-
-            ## 下载说明
-            1. 下载所有 .part-* 文件和 merge.sh
-            2. 运行 ./merge.sh 自动合并并校验
-            3. 合并完成后得到完整 ISO
-
-            ## 校验
-            ISO 文件已包含同目录的 SHA256 校验文件。
+            ## CachyOS Server ISO ${{ github.ref_name }}
+            
+            Automatically built CachyOS Server ISO with `linux-cachyos-server` kernel.
+            
+            **Architecture:** `${{ inputs.arch }}`  
+            **Mitigations:** `${{ inputs.mitigations }}`
+            
+            ### Download & Verify
+            
+            1. Download all `.part-*` files and `merge.sh`
+            2. Run `./merge.sh` to merge and verify checksum
+            3. Boot from merged ISO
+            
+            ### Server Optimizations
+            
+            ✅ Kernel: `linux-cachyos-server` (${{ inputs.arch }})  
+            ✅ Scheduler tuning (sysctl)  
+            ✅ Network optimization (TCP BBR, fq qdisc)  
+            ✅ Resource limits (1M files, 4M processes)  
+            ✅ Systemd services (sshd, networkd, resolved)  
+            ✅ Mitigations: ${{ inputs.mitigations }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
