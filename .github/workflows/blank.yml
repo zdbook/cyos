@@ -1,0 +1,150 @@
+name: Build CachyOS Server ISO
+run-name: Build CachyOS Server ISO (${{ inputs.arch }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: 'CPU 架构'
+        required: true
+        default: 'v4'
+        type: choice
+        options:
+          - v3
+          - v4
+          - znver4
+      mitigations:
+        description: 'CPU 安全缓解'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - 'off'
+      iso_commit:
+        description: 'CachyOS-Live-ISO 提交哈希，留空则使用 master'
+        required: false
+        default: ''
+        type: string
+      retention_days:
+        description: 'Artifact 保留天数'
+        required: true
+        default: 7
+        type: number
+        min: 1
+        max: 90
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ISO
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    container:
+      image: archlinux:latest
+      options: --cap-add=SYS_ADMIN --device=/dev/loop-control --device=/dev/loop0 --device=/dev/loop1
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Clone linux-cachyos package repo
+        run: |
+          git clone --depth 1 https://github.com/CachyOS/linux-cachyos.git linux-cachyos
+          ls -1 linux-cachyos/linux-cachyos-server* || true
+
+      - name: Configure Arch environment
+        run: |
+          set -euo pipefail
+          pacman-key --init
+          pacman-key --populate archlinux
+          curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF3B607488DB35A47' -o /tmp/cachyos-key.asc
+          pacman-key --add /tmp/cachyos-key.asc
+          pacman-key --lsign-key 882DCFE48E2051D48E2562ABF3B607488DB35A47 || true
+
+          cat >> /etc/pacman.conf <<'EOF'
+SigLevel = Required DatabaseOptional
+Timeout = 60
+ParallelDownloads = 6
+EOF
+
+          pacman -Syu --noconfirm
+          pacman -S --needed --noconfirm \
+            base-devel \
+            git \
+            curl \
+            archiso \
+            mkinitcpio-archiso \
+            squashfs-tools \
+            grub \
+            dosfstools \
+            mtools \
+            gnupg
+
+      - name: Cache pacman packages
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/pacman/pkg
+          key: ${{ runner.os }}-pacman-${{ hashFiles('build-iso.sh', '.github/workflows/build-cachyos-server-iso.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-pacman-
+
+      - name: Run build script
+        run: |
+          chmod +x build-iso.sh
+          ./build-iso.sh ${{ inputs.arch }} ${{ inputs.mitigations }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+          CACHYOS_ISO_COMMIT: ${{ inputs.iso_commit }}
+
+      - name: Split ISO into chunks
+        run: |
+          cd output
+          ISO_FILE=$(find . -maxdepth 1 -type f -name '*.iso' | sort | head -n 1)
+          if [ -z "$ISO_FILE" ]; then
+            echo "❌ 未找到 ISO 文件"
+            exit 1
+          fi
+          ISO_FILE=${ISO_FILE#./}
+          split -b 1800M "$ISO_FILE" "${ISO_FILE}.part-"
+          cat > merge.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+ISO_NAME=$(ls *.iso.part-* | head -n 1 | sed 's/\.part-.*//')
+if [ -z "$ISO_NAME" ]; then
+  echo "❌ 未找到 ISO 分块文件"
+  exit 1
+fi
+cat "$ISO_NAME.part-"* > "$ISO_NAME"
+sha256sum -c "$ISO_NAME.sha256"
+echo "✅ ISO 合并完成: $ISO_NAME"
+EOF
+          chmod +x merge.sh
+
+      - name: Upload built artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cachyos-server-iso-${{ inputs.arch }}-${{ github.run_number }}
+          path: output/*
+          retention-days: ${{ inputs.retention_days }}
+
+      - name: Create release when tagged
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: output/*
+          body: |
+            # CachyOS Server ISO ${{ github.ref_name }}
+
+            自动构建的 CachyOS Server ISO，已替换为 linux-cachyos-server 内核并注入服务器优化配置。
+
+            ## 下载说明
+            1. 下载所有 .part-* 文件和 merge.sh
+            2. 运行 ./merge.sh 自动合并并校验
+            3. 合并完成后得到完整 ISO
+
+            ## 校验
+            ISO 文件已包含同目录的 SHA256 校验文件。
